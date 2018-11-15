@@ -1,0 +1,1140 @@
+library(DESeq2)
+library(org.Hs.eg.db)
+library(clusterProfiler)
+options(digits = 5)
+library("BiocParallel")
+register(MulticoreParam(6))
+setwd("/media/pg/Volume2_4T/RNA_SEQ_our/Smart-seq2/Nicola")
+###### Source script ########################################
+######http://seqanswers.com/forums/showthread.php?t=31036####
+##### About filteringout rRNA contamination
+#### https://www.biostars.org/p/257426/
+#### https://www.biostars.org/p/184791/
+#### https://support.bioconductor.org/p/91218/ Convert to tpm
+#https://www.bioconductor.org/help/course-materials/2016/CSAMA/lect-06-rnaseq-analysis/rnaseq.pdf
+###########################################################################################################################
+#### Silencing 
+### http://seqanswers.com/forums/showthread.php?t=58923
+### http://seqanswers.com/forums/showthread.php?t=46793
+### https://support.bioconductor.org/p/80440/
+### https://support.bioconductor.org/p/85486/
+### http://seqanswers.com/forums/showthread.php?t=64039
+
+####Interferon dependent genes
+#### Data from http://journals.plos.org/plosbiology/article?id=10.1371/journal.pbio.2004086#sec009"
+
+### pairwise comparison among many pairs https://support.bioconductor.org/p/60032/
+
+IDGs = c("ENSG00000160710","ENSG00000128394","ENSG00000239713","ENSG00000130303","ENSG00000055332","ENSG00000117228",
+         "ENSG00000185745","ENSG00000119922","ENSG00000119917","ENSG00000185885","ENSG00000185201","ENSG00000142089",
+         "ENSG00000187608","ENSG00000172183","ENSG00000155363","ENSG00000157601","ENSG00000183486","ENSG00000089127",
+         "ENSG00000111335","ENSG00000135114","ENSG00000140464","ENSG00000134321","ENSG00000132256","ENSG00000105939",
+         "ENSG00000059378","ENSG00000135828","ENSG00000101347","ENSG00000159256","ENSG00000164054","ENSG00000130066",
+         "ENSG00000131203","ENSG00000132274","ENSG00000138646","ENSG00000172716","ENSG00000163565","ENSG00000163029",
+         "ENSG00000154451","ENSG00000067066","ENSG00000138135","ENSG00000132109")
+
+
+IDGs_nicola = read.delim(file="/media/pg/Volume2_4T/RNA_SEQ_our/Smart-seq2/Nicola/IDGs.txt",sep="\t")
+dim(IDGs_nicola)
+
+IDGs_nicola_ID = as.character(IDGs_nicola$Entrez.Gene)
+IDGs_nicola_ensembl = mapIds(org.Hs.eg.db,keys=IDGs_nicola_ID,
+                       keytype = "ENTREZID",
+                       column = c("ENSEMBL"),
+                       multiVals = "first")
+convertIDs <- function( ids, from, to, db, ifMultiple=c("putNA", "useFirst")) {
+  stopifnot( inherits( db, "AnnotationDb" ) )
+  ifMultiple <- match.arg( ifMultiple )
+  suppressWarnings( selRes <- AnnotationDbi::select(
+    db, keys=ids, keytype=from, columns=c(from,to) ) )
+  if ( ifMultiple == "putNA" ) {
+    duplicatedIds <- selRes[ duplicated( selRes[,1] ), 1 ]
+    selRes <- selRes[ ! selRes[,1] %in% duplicatedIds, ]
+  }
+  return( selRes[ match( ids, selRes[,1] ), 2 ] )
+}
+
+
+library(scales)
+squish_trans <- function(from, to, factor) {
+  
+  trans <- function(x) {
+    
+    # get indices for the relevant regions
+    isq <- x > from & x < to
+    ito <- x >= to
+    
+    # apply transformation
+    x[isq] <- from + (x[isq] - from)/factor
+    x[ito] <- from + (to - from)/factor + (x[ito] - to)
+    
+    return(x)
+  }
+  
+  inv <- function(x) {
+    
+    # get indices for the relevant regions
+    isq <- x > from & x < from + (to - from)/factor
+    ito <- x >= from + (to - from)/factor
+    
+    # apply transformation
+    x[isq] <- from + (x[isq] - from) * factor
+    x[ito] <- to + (x[ito] - (from + (to - from)/factor))
+    
+    return(x)
+  }
+  
+  # return the transformation
+  return(trans_new("squished", trans, inv))
+}
+library(ggplot2)
+mytheme =theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+               panel.background = element_blank(), axis.line = element_line(colour = "black"))
+
+fpkmToTpm <- function(fpkm) {
+  
+  exp(log(fpkm) - log(sum(fpkm)) + log(1e6))
+  
+}
+
+Coding_Filtering <- function(dds){
+  require(biomaRt)
+  ensembl <- useMart("ensembl", host = "http://feb2014.archive.ensembl.org",dataset = "hsapiens_gene_ensembl") #### version 75
+  attributes = listAttributes(ensembl)
+  print("Getting annotations through biomart library...")
+  gene_symbol = getBM(attributes=c('ensembl_gene_id','external_gene_id','gene_biotype','description','chromosome_name'),mart = ensembl)
+  gene_symbol$description = gsub('\\[.*','',gene_symbol$description)
+  gene_symbol = subset(gene_symbol,gene_symbol$ensembl_gene_id%in%rownames(dds)) ### 57443
+  gene_symbol = gene_symbol[order(gene_symbol$ensembl_gene_id),]
+  featureData = data.frame(rownames(dds),gene_symbol)
+  mcols(dds) <- DataFrame(mcols(dds),
+                             SYMBOL=featureData$external_gene_id,
+                             gene_name=featureData$description,
+                             chr=featureData$chromosome_name,
+                             gene_biotype=featureData$gene_biotype)
+  print("Filtering out mitochondrial and Y genes")
+#  autosome = subset(featureData,!featureData$chromosome_name%in%c("MT","Y"))
+  autosome = subset(featureData,!featureData$chromosome_name%in%c("MT"))
+  dds = dds[rownames(dds)%in%autosome$ensembl_gene_id,]### exclude mithocondrial genes
+  select = c("lincRNA","protein_coding")
+  CodingGenes = subset(featureData,featureData$gene_biotype%in%select); dim(CodingGenes) ### 27374 coding genes (lincRNA,protein_coding)
+  print("keep only protein and lincRNA coding genes")
+  dds = dds[rownames(dds)%in%CodingGenes$ensembl_gene_id,]### keep only protein and lincRNA coding
+  return(dds)
+}
+
+
+#### Load data
+
+sampleTable = read.csv("/media/pg/Volume2_4T/RNA_SEQ_our/Smart-seq2/Nicola/SampleTable.csv",sep=",")
+sampleTable = sampleTable[order(sampleTable$order.Sample),]
+
+sampleTable = subset(sampleTable,sampleTable$CellType%in%c("HL-60"))
+sample = subset(sampleTable,sampleTable$genotype%in%c("KO"))
+
+directory <-"/media/pg/Volume2_4T/RNA_SEQ_our/Smart-seq2/Nicola/HISAT2/HTSEQ_count"
+
+
+#### Load data
+library(dplyr)
+sampleTable = read.csv("/media/pg/Volume2_4T/RNA_SEQ_our/Smart-seq2/Nicola/SampleTable.csv",sep=",")
+sampleTable = subset(sampleTable,!sampleTable$CellType=="PMN")
+sampleTable = sampleTable[order(sampleTable$order.Sample),]
+sampleTable$Sequencing_batch = as.factor(sampleTable$Sequencing_batch)
+sampleTable$Group2 = factor(gsub("siC","WT",sampleTable$Group2))
+sampleTable$Group2 = gsub("siOCT","KO",sampleTable$Group2)
+
+sampleTable = sampleTable %>% dplyr::select(Name,fileName,Exp,Sequencing_batch,Exp_and_Sequecing,genotype,altCondition,condition,Group2)
+colnames(sampleTable) = c("Name","fileName","Exp","Sequencing_batch","Exp_and_Sequecing","genotype","altCondition","condition","Group")
+sampleTable$Exp = factor(sampleTable$Exp)
+sampleTable$Group = factor(sampleTable$Group)
+
+sample = subset(sampleTable,sampleTable$altCondition%in%c("R848"))
+#sample = subset(sample,!sample$Exp%in%c("exp3"))
+
+library(DESeq2)
+
+ddsHTSeq <- DESeqDataSetFromHTSeqCount(sampleTable=sample,
+                                       directory=directory,
+                                       design= ~ Exp + genotype)
+
+
+dir  <-"/media/pg/Volume2_4T/RNA_SEQ_our/Smart-seq2/Nicola"
+gtf_file <- file.path(dir,"Homo_sapiens.GRCh37.75.gtf")
+library(GenomicFeatures)
+txdb_Ensembl <- makeTxDbFromGFF(gtf_file,format="gtf", circ_seqs=character())
+genes <- exonsBy(txdb, by="gene")
+ddsHTSeq = estimateSizeFactors(ddsHTSeq)
+rowRanges(ddsHTSeq) <- genes
+
+fpkm = fpkm(ddsHTSeq,robust=T)
+fpkm[grepl("ENSG00000028277",rownames(fpkm)),]
+
+keep <- rowSums(counts(ddsHTSeq,normalized=TRUE)>1) >= 3
+ddsHTSeq = ddsHTSeq[keep,]
+colData(ddsHTSeq)
+
+ddsHTSeq = Coding_Filtering(ddsHTSeq)
+colnames(ddsHTSeq) = paste(colData(ddsHTSeq)$Group,colData(ddsHTSeq)$Exp,sep="_")
+
+ddsHTSeq$genotype= relevel(ddsHTSeq$genotype, ref = "WT")
+ddsHTSeq = DESeq(ddsHTSeq)
+
+Expression_FPKM_gsea_input <- data.frame(fpkm(ddsHTSeq, robust = TRUE))
+Expression_FPKM_gsea_input$ID = rownames(Expression_FPKM_gsea_input)
+Expression_FPKM_gsea_input$SYMBOL = mcols(ddsHTSeq)$SYMBOL
+Expression_FPKM_gsea_input$mean_WT = rowMeans(Expression_FPKM_gsea_input[,c(1:4)])
+Expression_FPKM_gsea_input$mean_siOCT2 = rowMeans(Expression_FPKM_gsea_input[,c(5:8)])
+Expression_FPKM_gsea_input$inhibition = -100*(1-Expression_FPKM_gsea_input$mean_siOCT2/Expression_FPKM_gsea_input$mean_WT)
+Expression_FPKM_gsea_input$allMean = rowMeans(Expression_FPKM_gsea_input[,c(1:8)])
+
+keep = rowSums(Expression_FPKM_gsea_input[,c(1:8)]>= 0.3) >=4
+Expression_FPKM_gsea_input = Expression_FPKM_gsea_input[keep,]
+Expression_FPKM_gsea_input = Expression_FPKM_gsea_input[order(Expression_FPKM_gsea_input$inhibition),]
+
+
+gsea_input = Expression_FPKM_gsea_input[,c(9,1:8)]
+colnames(gsea_input) <- c("Probe Set ID","WT_R848_exp1","WT_R848_exp2","WT_R848_exp3","WT_R848_exp4","siOCT2_R848_exp1","siOCT2_R848_exp2","siOCT2_R848_exp3","siOCT2_R848_exp4")
+write.table(gsea_input,file="/home/pg/Desktop/GSEA/gsea_input_HL60.fpkm.txt",quote=FALSE, sep="\t",row.names=F)
+
+
+head(Expression_FPKM)
+write.table(Expression_FPKM,file="/home/pg/Desktop/GSEA/HL60_fpkm.txt",quote=FALSE, sep="\t")
+ddsHTSeq = DESeq(ddsHTSeq)
+ddsHTSeq = Coding_Filtering(ddsHTSeq)
+resultsNames(ddsHTSeq)
+# 
+res_R848 <- results(ddsHTSeq,alpha=0.05, name =c("genotype_KO_vs_WT"))
+summary(res_R848)
+plotDispEsts(ddsHTSeq)
+res_R848$SYMBOL = mcols(ddsHTSeq)$SYMBOL
+res_R848[order(res_R848$padj),]
+
+res_R848[grepl("POU2F2",res_R848$SYMBOL),]
+res_R848[grepl("IL8",res_R848$SYMBOL),]
+res_R848[grepl("NFKBIZ",res_R848$SYMBOL),]
+res_R848[grepl("LYN",res_R848$SYMBOL),]
+res_R848[grepl("CD274",res_R848$SYMBOL),]
+
+data = plotCounts(ddsHTSeq, gene="ENSG00000028277", intgroup = c("Exp","genotype","altCondition") , returnData=TRUE)
+ggplot(data, aes(x=genotype, y=count, col=Exp,group=Exp)) + 
+  geom_point(position= position_jitter(width=0.1,height = 0)) + geom_line() + ylim(0,1600)
+
+data$order = c(rep(1,4),rep(3,4),rep(2,4),rep(4,4))
+data$order2 = c(rep(1,4),rep(2,4),rep(4,4),rep(4,4))
+data
+
+WT_R848 = subset(data,data$altCondition%in%c("R848") & data$genotype%in%c("WT"))$count
+KO_R848 = subset(data,data$altCondition%in%c("R848") & data$genotype%in%c("KO"))$count
+
+fold = log2(mean(KO_R848)/mean(WT_R848));fold 
+
+colData(ddsHTSeq)
+mod = model.matrix(~Exp+altCondition+altCondition:genotype,colData(ddsHTSeq))
+
+ddsHTSeq2 = ddsHTSeq#[,!colData(ddsHTSeq)$Exp=="exp4"]
+Exp = colData(ddsHTSeq2)$Exp
+altCondition = colData(ddsHTSeq2)$altCondition
+genotype = colData(ddsHTSeq2)$genotype
+Group = colData(ddsHTSeq2)$Group
+
+model = lm(data$count ~ Exp + altCondition + genotype + altCondition:genotype)
+summary(model)
+
+model = lm(data$count ~Exp + altCondition+altCondition:genotype)
+summary(model)
+
+
+ggplot(data, aes(x=reorder(Group,order), y=count, col=Exp,group=Exp)) + 
+  geom_point(position= position_jitter(width=0.1,height = 0)) + geom_line() + ylim(0,1600)
+
+ggplot(data, aes(x=reorder(Group,order2), y=count, col=Exp,group=Exp)) + 
+  geom_point(position= position_jitter(width=0.1,height = 0)) + geom_line() + ylim(0,1600)
+
+design(ddsHTSeq) = ~Exp + altCondition+altCondition:genotype
+ddsHTSeq = DESeq(ddsHTSeq)
+
+#### QC
+plotDispEsts(ddsHTSeq)
+ddsHTSeq_rld  <- rlogTransformation(ddsHTSeq, blind=FALSE)
+distsRL <- dist(t(assay(ddsHTSeq_rld)))
+mat <- as.matrix(distsRL)
+pheatmap::pheatmap(mat)
+
+ddsHTSeq_rld_cor = cor(assay(ddsHTSeq_rld))
+pheatmap::pheatmap(ddsHTSeq_rld_cor)
+
+library(colorRamps)
+library(pheatmap)
+hmcol <- rev(blue2green2red(500))
+pheatmap(mat,clustering_distance_rows = distsRL, clustering_distance_cols =distsRL,color = hmcol)
+library(pcaExplorer)
+plotPCA(ddsHTSeq_rld,intgroup = "altCondition")
+plotPCA(ddsHTSeq_rld,intgroup = "Exp")
+plotPCA(ddsHTSeq_rld,intgroup = "genotype")
+
+pcaplot(ddsHTSeq_rld , intgroup = c("genotype","altCondition"),ellipse=F,pcX = 2, pcY = 3)
+pcaplot(ddsHTSeq_rld , intgroup = c("genotype","altCondition"),ellipse=F,pcX = 3, pcY = 4)
+pcaplot(ddsHTSeq_rld , intgroup = c("genotype","altCondition"),ellipse=F,pcX = 7, pcY = 8)
+
+
+
+pca <- princomp(assay(ddsHTSeq_rld),cor=T)
+summary(pca)
+
+head(assay(ddsHTSeq_rld))
+### Remove batch effect
+rld_dds_batch = ddsHTSeq_rld
+#colnames(rld_dds_batch) = paste(names(names),colData(rld_dds_batch)$Exp,sep="_")
+mod = model.matrix(~ genotype, data=colData(rld_dds_batch))
+mod = mod[,which(colSums(mod)>0)]
+batch = as.factor(rld_dds_batch$Exp)
+
+#View(mod )
+assay(rld_dds_batch) <- limma::removeBatchEffect(assay(rld_dds_batch),batch = batch,design=mod)
+
+PCA <- prcomp(t(assay(rld_dds_batch)), scale = F)
+percentVar <- round(100*PCA$sdev^2/sum(PCA$sdev^2),1)
+plot(PCA)
+
+plotPCA(rld_dds_batch,intgroup = "altCondition")
+plotPCA(rld_dds_batch,intgroup = "Exp")
+plotPCA(rld_dds_batch,intgroup = "genotype")
+
+pcaplot(rld_dds_batch , intgroup = c("genotype","altCondition"),ellipse=F,pcX = 1, pcY = 2)
+pcaplot(rld_dds_batch , intgroup = c("genotype","altCondition"),ellipse=F,pcX = 1, pcY = 3)
+pcaplot(rld_dds_batch , intgroup = c("genotype","altCondition"),ellipse=F,pcX = 1, pcY = 4)
+pcaplot(rld_dds_batch , intgroup = c("genotype","altCondition"),ellipse=F,pcX = 1, pcY= 5)
+pcaplot(rld_dds_batch , intgroup = c("genotype","altCondition"),ellipse=F,pcX = 1, pcY= 6)
+
+######## SVA
+# library(sva)
+# dat <- counts(ddsHTSeq, normalized=TRUE) #### Only correcting for size library. Batch effects are a separate effect which should be estimated after removing know library size differences
+# idx <- rowMeans(dat) > 1
+# dat <- dat[idx,]
+# mod = model.matrix(~genotype + altCondition + altCondition:genotype, data=colData(ddsHTSeq))
+# mod0 <- model.matrix(~ 1, colData(ddsHTSeq))
+# svseq <- svaseq(dat, mod, mod0, n.sv=3)
+# 
+# plot(svseq$sv[,1], svseq$sv[,2], col=ddsHTSeq$silencing, pch=16)
+# par(mfrow = c(2,2), mar =c(3,5,3,1))
+# for (i in 1:3){
+#   stripchart(svseq$sv[,i] ~ ddsHTSeq$altCondition , vertical=TRUE, main = paste0("SV",i))
+#   abline(h=0)
+# }
+# 
+# dds.sva <- ddsHTSeq
+# dds.sva$SV1 <- svseq$sv[,1]
+# dds.sva$SV2 <- svseq$sv[,2]
+# dds.sva$SV3 <- svseq$sv[,3]
+# 
+# design(dds.sva) <- ~ SV1 + SV2 + SV3+ genotype + altCondition + altCondition:genotype
+# dds.sva <- DESeq(dds.sva)
+# 
+# resultsNames(dds.sva)
+# res_si_R848 <- results(dds.sva,alpha=0.05,  name = "genotypeKO.altConditionR848")#contrast = c("Group2","R848siOCT","R848siC"))
+# #res_si_R848 <- results(ddsHTSeq, alpha=0.05,contrast = c(0,0,0,0,0,1,1))
+# summary(res_si_R848)
+# res_si_R848$SYMBOL = mcols(dds.sva)$SYMBOL
+# res_si_R848$ensembl = rownames(dds.sva)
+# head(data.frame(res_si_R848[order(res_si_R848$log2FoldChange),]),20)
+# res_si_R848[grepl("IL8",res_si_R848$SYMBOL),]
+# res_si_R848[grepl("POU2F2",res_si_R848$SYMBOL),]
+# 
+# with(res_si_R848, plot(log2FoldChange, -log10(padj), pch=16, cex=0.5, main="Volcano plot",
+#                        xlim=c(-10,10),col=ifelse(padj < 0.05,'red','black')))
+
+#####
+# ddsHTSeq_HL60 = ddsHTSeq
+# ddsHTSeq_HL60.fpkm = fpkm(ddsHTSeq_HL60,robust = TRUE)
+# expressed <- function(fpkm_data,dds){
+#   threshod =0.3
+#     f = subset(fpkm_data,(rowMeans2(fpkm_data[,1:2]) >=threshod | rowMeans2(fpkm_data[,3:4]) >=threshod | rowMeans2(fpkm_data[,5:6]) >=threshod | rowMeans2(fpkm_data[,7:8]) >=threshod) | rowMeans2(fpkm_data[,9:10]) >=threshod | rowMeans2(fpkm_data[,11:12]) >=threshod | rowMeans2(fpkm_data[,13:14]) >=threshod | rowMeans2(fpkm_data[,15:16]) >=threshod)
+# #    f = subset(fpkm_data,(rowMeans2(fpkm_data[,1:2]) >=threshod | rowMeans2(fpkm_data[,3:4]) >=threshod | rowMeans2(fpkm_data[,5:6]) >=threshod | rowMeans2(fpkm_data[,7:8]) >=threshod) | rowMeans2(fpkm_data[,9:10]) >=threshod | rowMeans2(fpkm_data[,11:12]) >=threshod)
+#   dds = subset(dds,rownames(dds)%in%rownames(f))
+#   g = data.frame(f,mcols(dds)[,c("SYMBOL","gene_name")])
+#   a = g[order(rowSums(g[,1:4])),]
+#   return(a)
+# }
+# 
+# ddsHTSeq_HL60.fpkm_expressed = expressed(ddsHTSeq_HL60.fpkm,ddsHTSeq_HL60) ### 13458
+# dim(ddsHTSeq_HL60.fpkm_expressed)
+# WriteXLS(as.data.frame(ddsHTSeq_HL60.fpkm_expressed), "ddsHTSeq_HL60.fpkm_expressed.xlsx",row.names=T,SheetNames="0.3 FPKM")
+# 
+# ddsHTSeq_HL60.fpkm_expressed[grepl("POU2F2",ddsHTSeq_HL60.fpkm_expressed$SYMBOL),]
+# ddsHTSeq_HL60.fpkm_expressed[grepl("^CCL4$",ddsHTSeq_HL60.fpkm_expressed$SYMBOL),]
+# ddsHTSeq_HL60.fpkm_expressed[grepl("^IL8$",ddsHTSeq_HL60.fpkm_expressed$SYMBOL),]
+# ddsHTSeq_HL60.fpkm_expressed[grepl("^ACTN1$",ddsHTSeq_HL60.fpkm_expressed$SYMBOL),]
+# ddsHTSeq_HL60.fpkm_expressed[grepl("^CCL20",ddsHTSeq_HL60.fpkm_expressed$SYMBOL),]
+# 
+# ddsHTSeq = subset(ddsHTSeq_HL60,rownames(ddsHTSeq_HL60)%in%rownames(ddsHTSeq_HL60.fpkm_expressed))
+# colData(ddsHTSeq)
+# colnames(ddsHTSeq)
+# substr(names(mcols(ddsHTSeq)),1,10) 
+# mcols(mcols(ddsHTSeq), use.names=TRUE)[1:10,]
+# head(coef(ddsHTSeq))
+# 
+# ##### Stimolo
+# resultsNames(ddsHTSeq)
+# 
+# res_R848 <- results(ddsHTSeq,alpha=0.05, name =c("altCondition_R848_vs_UT"))
+# res_R848 <- results(ddsHTSeq,alpha=0.05, contrast = c(0,0,0,0,1,0,0))# è uguale al primo
+# summary(res_R848)
+# res_R848$SYMBOL = mcols(ddsHTSeq)$SYMBOL
+# 
+# head(data.frame(res_R848[order(res_R848$padj),]),20)
+# res_R848[grepl("POU2F2",res_R848$SYMBOL),]
+# DESeq::plotMA(res_R848)
+# with(res_R848, plot(log2FoldChange, -log10(padj), pch=16, cex=0.5, main="Volcano plot",
+#                        xlim=c(-10,10),col=ifelse(padj < 0.05,'red','black')))
+# 
+# data = data.frame(res_R848);dim(data)
+# #data = data.frame(res_siOCT2);dim(data)
+# data <- data[!is.na(data$padj),];dim(data)
+# data1 = data.frame(subset(data,data$padj<=0.05 & data$log2FoldChange >0))
+# data2 = data.frame(subset(data,data$padj<=0.05 & data$log2FoldChange < 0))
+# 
+# labs_data = subset(data1,data1$SYMBOL%in%c("IL8","NFKBIZ","POU2F2"))
+# labs_data = labs_data[order(labs_data$padj),]
+# labs_data$FC= paste(labs_data$SYMBOL,round(labs_data$log2FoldChange,2),sep=" , ")
+# 
+# modulated = rbind(data1,data2)
+# 
+# data = subset(data,!rownames(data)%in%c(rownames(data1),rownames(data2)));dim(data)
+# summary(data)
+# 
+# #data = subset(data,data$padj>0.5)
+# 
+# #data = sample_n(data , 5000)
+# 
+# 
+# library(ggplot2)
+# 
+# #cairo_ps(filename="/home/pg/Documents/Shared-Win10/Paper_OCT2/HL60_R848_OCT2_size3.ps",width=10,height = 10,pointsize=12)
+# cairo_ps(filename="/home/pg/Documents/Shared-Win10/Paper_OCT2/HL60_R848_size3.ps",width=10,height = 10,pointsize=12)
+# p <- ggplot(data, aes(x = log2FoldChange, y = -log10(padj))) + geom_point(size=3, colour = "grey") +
+#   scale_y_continuous(trans = squish_trans(30,90,10), breaks = c(0,10,20,30,40,60,80),limits = c(0,90)) + 
+#   scale_x_continuous(trans = squish_trans(-2,2,0.5),breaks = c(6,-4,-2,-1,0,1,2,4,6),limits = c(-6,6)) +
+#   theme(panel.background = element_blank()) + labs(x = "log2FoldChange", y="log10 padj") +theme_bw()
+# 
+# p + geom_point(data = data1, colour = "darkred",size=3) + geom_point(data = data2, colour = "darkblue",size=3) + geom_vline(xintercept=c(-1,1), linetype="dashed", color = c("black","black")) +
+#   geom_hline(yintercept=-log10(0.05), linetype="dashed", color = "black") +
+#   ggrepel::geom_label_repel(data = labs_data, mapping = aes(label = FC))  + mytheme + geom_point(data = labs_data, colour = "blue",size=3)
+# 
+# dev.off()
+
+#### Silencing
+library("IHW")
+data = plotCounts(ddsHTSeq, gene="ENSG00000028277", intgroup = c("Exp","genotype","altCondition") , returnData=TRUE)
+data$order = c(rep(1,4),rep(3,4),rep(2,4),rep(4,4))
+data$order2 = c(rep(1,4),rep(2,4),rep(4,4),rep(4,4))
+data
+
+ggplot(data, aes(x=reorder(Group,order), y=count, col=Exp,group=Exp)) + 
+  geom_point(position= position_jitter(width=0.1,height = 0)) + geom_line() + ylim(0,1600)
+
+ggplot(data, aes(x=reorder(Group,order2), y=count, col=Exp,group=Exp)) + 
+  geom_point(position= position_jitter(width=0.1,height = 0)) + geom_line() + ylim(0,1600)
+
+WT_R848 = subset(data,data$altCondition%in%c("R848") & data$genotype%in%c("WT"))$count
+KO_R848 = subset(data,data$altCondition%in%c("R848") & data$genotype%in%c("KO"))$count
+
+fold = log2(mean(KO_R848)/mean(WT_R848));fold 
+
+colData(ddsHTSeq)
+mod = model.matrix(~Exp+altCondition+altCondition:genotype,colData(ddsHTSeq))
+
+ddsHTSeq2 = ddsHTSeq#[,!colData(ddsHTSeq)$Exp%in%c("exp1","exp2")]
+data = plotCounts(ddsHTSeq2, gene="ENSG00000028277", intgroup = c("Exp","genotype","altCondition") , returnData=TRUE)
+Exp = colData(ddsHTSeq2)$Exp
+altCondition = colData(ddsHTSeq2)$altCondition
+genotype = colData(ddsHTSeq2)$genotype
+Group = colData(ddsHTSeq2)$Group
+Sequencing_batch = as.factor(colData(ddsHTSeq2)$Sequencing_batch)
+  
+model = lm(data$count ~ Sequencing_batch + altCondition + altCondition:genotype)
+summary(model)
+
+model2 = lm(data$count ~ Exp +  altCondition + altCondition:genotype)
+summary(model2) ### 0.00137 ** all; no exp1 0.02340 *; no exp2 0.003480 **; no exp 3 0.002247 **
+
+
+ddsHTSeq.1 = ddsHTSeq[,colData(ddsHTSeq)$Group%in%c("R848WT","R848KO ")]
+ddsHTSeq.1$altCondition <- droplevels(ddsHTSeq.1$altCondition)
+ddsHTSeq.1$genotype <- droplevels(ddsHTSeq.1$genotype)
+ddsHTSeq.1$condition <- droplevels(ddsHTSeq.1$condition)
+ddsHTSeq.1$Group <- droplevels(ddsHTSeq.1$Group)
+
+ddsHTSeq.1 = DESeq(ddsHTSeq.1)
+
+
+
+
+###### limma
+library(limma)
+counts = counts(ddsHTSeq,normalized=T)
+genotype1 = factor(genotype,levels=c("WT","KO"))
+treatment = factor(altCondition,levels=c("UT","R848"))
+
+
+design = model.matrix(~  genotype1 +  genotype1:treatment)
+colnames(design )
+fit <- lmFit(counts,design)
+fit <- eBayes(fit)
+WT_R848 = topTable(fit,coef = 3,n=nrow(counts),sort.by = NULL)
+WT_R848$SYMBOL = mcols(ddsHTSeq)$SYMBOL
+
+WT_R848 = WT_R848[sort]
+  
+a = data.frame(mcols(ddsHTSeq)$SYMBOL,rownames(ddsHTSeq))
+
+ddsHTSeq$altCondition = relevel(ddsHTSeq$altCondition, ref = "UT")
+ddsHTSeq$genotype= relevel(ddsHTSeq$genotype, ref = "WT")
+design(ddsHTSeq) = ~ Exp + Group
+ddsHTSeq = DESeq(ddsHTSeq)
+resultsNames(ddsHTSeq)
+res_WT_R848 <- results(ddsHTSeq, alpha=0.05, name = c("altCondition_R848_vs_UT"))
+summary(res_WT_R848)
+
+res_WT_R848 <- results(ddsHTSeq, alpha=0.05, contrast = c("Group","R848WT","R848KO"))
+summary(res_WT_R848)
+
+with(res_WT_R848, plot(log2FoldChange, -log10(padj), pch=16, cex=0.5, main="Volcano plot",
+                      xlim=c(-10,10),col=ifelse(padj < 0.05,'red','black')))
+
+
+res_KO_R848 <- results(ddsHTSeq, alpha=0.05, list(c("altCondition_R848_vs_UT","altConditionR848.genotypeKO")))
+summary(res_KO_R848)
+
+with(res_KO_R848, plot(log2FoldChange, -log10(padj), pch=16, cex=0.5, main="Volcano plot",
+                       xlim=c(-10,10),col=ifelse(padj < 0.05,'red','black')))
+
+
+plot(res_WT_R848$log2FoldChange,res_KO_R848$log2FoldChange)
+
+res_siOCT2 <- results(ddsHTSeq, alpha=0.05, name = c("altConditionR848.genotypeKO"))
+summary(res_siOCT2)
+
+with(res_siOCT2, plot(log2FoldChange, -log10(pvalue), pch=16, cex=0.5, main="Volcano plot",
+                       xlim=c(-10,10),col=ifelse(pvalue < 0.05,'red','black')))
+
+with(res_siOCT2, plot(log2FoldChange, -log10(padj), pch=16, cex=0.5, main="Volcano plot",
+                      xlim=c(-10,10),col=ifelse(padj < 0.05,'red','black')))
+
+plot(res_WT_R848$log2FoldChange,res_siOCT2$log2FoldChange)
+
+
+res_siOCT2$SYMBOL= mcols(ddsHTSeq)$SYMBOL
+res_siOCT2[grepl("POU2F2",res_siOCT2$SYMBOL),]
+res_siOCT2[grepl("IL8",res_siOCT2$SYMBOL),]
+res_siOCT2[grepl("NFKBIZ",res_siOCT2$SYMBOL),]
+res_siOCT2[grepl("LYN",res_siOCT2$SYMBOL),]
+res_siOCT2[grepl("IRAK3",res_siOCT2$SYMBOL),]
+res_siOCT2[grepl("CD274",res_siOCT2$SYMBOL),]
+
+head(data.frame(res_siOCT2[order(res_siOCT2$pvalue),]),20)
+
+data = plotCounts(ddsHTSeq, gene="ENSG00000111145", intgroup = c("Exp","genotype","altCondition") , returnData=TRUE)
+data$order = c(rep(1,4),rep(3,4),rep(2,4),rep(4,4))
+data$order2 = c(rep(1,4),rep(2,4),rep(4,4),rep(4,4))
+data
+
+ggplot(data, aes(x=reorder(Group,order), y=count, col=Exp,group=Exp)) + 
+  geom_point(position= position_jitter(width=0.1,height = 0)) + geom_line() 
+
+ggplot(data, aes(x=reorder(Group,order2), y=count, col=Exp,group=Exp)) + 
+  geom_point(position= position_jitter(width=0.1,height = 0)) + geom_line() + ylim(0,1600)
+
+
+res_siOCT2.1 <- results(ddsHTSeq, alpha=0.05,contrast = list("altConditionR848.genotypeKO","altCondition_R848_vs_UT"),listValues =c(1,-1))
+summary(res_siOCT2)
+
+with(res_siOCT2.1, plot(log2FoldChange, -log10(padj), pch=16, cex=0.5, main="Volcano plot",
+                      xlim=c(-10,10),col=ifelse(padj < 0.05,'red','black')))
+
+res_siOCT2.1$SYMBOL= mcols(ddsHTSeq)$SYMBOL
+res_siOCT2.1[grepl("POU2F2",res_siOCT2.1$SYMBOL),]
+res_siOCT2.1[grepl("IL8",res_siOCT2.1$SYMBOL),]
+res_siOCT2.1[grepl("NFKBIZ",res_siOCT2.1$SYMBOL),]
+res_siOCT2.1[grepl("LYN",res_siOCT2.1$SYMBOL),]
+res_siOCT2.1[grepl("IRAK3",res_siOCT2.1$SYMBOL),]
+res_siOCT2.1[grepl("CD274",res_siOCT2.1$SYMBOL),]
+
+
+head(data.frame(res_siOCT2.1[order(res_siOCT2.1$padj),]),20)
+
+
+with(res_siOCT2, plot(log2FoldChange, -log10(padj), pch=16, cex=0.5, main="Volcano plot",
+                       xlim=c(-10,10),col=ifelse(padj < 0.05,'red','black')))
+head(data.frame(res_siOCT2[order(res_siOCT2$padj),]),30)
+
+
+res_si_R848 <- results(ddsHTSeq,alpha=0.05,  name = c("genotypeKO.altConditionR848"))
+res_si_R848 <- results(ddsHTSeq, alpha=0.05,contrast = c(0,0,0,0,0,1,1))
+summary(res_si_R848)
+res_si_R848$SYMBOL = mcols(ddsHTSeq)$SYMBOL
+res_si_R848$ensembl = rownames(ddsHTSeq)
+head(data.frame(res_si_R848[order(res_si_R848$log2FoldChange),]),20)
+res_si_R848[grepl("IL8",res_si_R848$SYMBOL),]
+res_si_R848[grepl("POU2F2",res_si_R848$SYMBOL),]
+
+with(res_si_R848, plot(log2FoldChange, -log10(padj), pch=16, cex=0.5, main="Volcano plot",
+                      xlim=c(-10,10),col=ifelse(padj < 0.05,'red','black')))
+
+###### 10 and 20 percent
+
+res_R848_up = subset(res_R848,res_R848$padj < 0.05)
+res_R848_up = subset(res_R848_up,res_R848_up$log2FoldChange > 0)
+ddsHTSeq_HL60.fpkm_expressed_sig = subset(ddsHTSeq_HL60.fpkm_expressed,rownames(ddsHTSeq_HL60.fpkm_expressed)%in%rownames(res_R848_up));dim(ddsHTSeq_HL60.fpkm_expressed_sig) ### 418
+# ddsHTSeq_HL60.fpkm_expressed_sig$ENSEMBL = rownames(ddsHTSeq_HL60.fpkm_expressed_sig)
+# rownames(ddsHTSeq_HL60.fpkm_expressed_sig) = ddsHTSeq_HL60.fpkm_expressed_sig$SYMBOL
+
+# ### 12 samples
+# ddsHTSeq_HL60.fpkm_expressed_sig$Mean_siC_R848 = rowMeans(as.matrix(ddsHTSeq_HL60.fpkm_expressed_sig[,c("HL_siCtrl_LPS_1","HL_siCtrl_LPS_2","HL_60_si_ctrl_R848_1")]))
+# ddsHTSeq_HL60.fpkm_expressed_sig$Mean_siOCT_R848 = rowMeans(as.matrix(ddsHTSeq_HL60.fpkm_expressed_sig[,c("HL_siOCT_LPS_1","HL_siOCT_LPS_2","HL_60_si_OCT2_R848_1")]))
+
+# 16 samples
+ddsHTSeq_HL60.fpkm_expressed_sig$Mean_siC_C = rowMeans(as.matrix(ddsHTSeq_HL60.fpkm_expressed_sig[,c("HL_siCtrl_C1","HL_siCtrl_c2","HL_60_si_Ctrl_C1","HL_60_si_ctrl_C2")]))
+ddsHTSeq_HL60.fpkm_expressed_sig$Mean_siC_R848 = rowMeans(as.matrix(ddsHTSeq_HL60.fpkm_expressed_sig[,c("HL_siCtrl_LPS_1","HL_siCtrl_LPS_2","HL_60_si_ctrl_R848_1","HL_60_si_ctrl_R848_2")]))
+ddsHTSeq_HL60.fpkm_expressed_sig$Mean_siC_R848_noBG = ddsHTSeq_HL60.fpkm_expressed_sig$Mean_siC_R848-ddsHTSeq_HL60.fpkm_expressed_sig$Mean_siC_C 
+
+ddsHTSeq_HL60.fpkm_expressed_sig$Mean_siOCT_C = rowMeans(as.matrix(ddsHTSeq_HL60.fpkm_expressed_sig[,c("HL_siOCT_C1","HL_siOCT_C2","HL_60_si_OCT2_C1","HL_60_si_OCT2_C2")]))
+ddsHTSeq_HL60.fpkm_expressed_sig$Mean_siOCT_R848 = rowMeans(as.matrix(ddsHTSeq_HL60.fpkm_expressed_sig[,c("HL_siOCT_LPS_1","HL_siOCT_LPS_2","HL_60_si_OCT2_R848_1","HL_60_si_OCT2_R848_2")]))
+ddsHTSeq_HL60.fpkm_expressed_sig$Mean_siOCT_R848_noBG = ddsHTSeq_HL60.fpkm_expressed_sig$Mean_siOCT_R848-ddsHTSeq_HL60.fpkm_expressed_sig$Mean_siOCT_C
+
+ddsHTSeq_HL60.fpkm_expressed_sig$Mean = rowMeans(as.matrix(ddsHTSeq_HL60.fpkm_expressed_sig[,c("Mean_siC_R848","Mean_siOCT_R848")]))
+ddsHTSeq_HL60.fpkm_expressed_sig$FC_siOCT_vs_siC= ddsHTSeq_HL60.fpkm_expressed_sig$Mean_siOCT_R848/ddsHTSeq_HL60.fpkm_expressed_sig$Mean_siC_R848
+ddsHTSeq_HL60.fpkm_expressed_sig$PercenInhi = -100*(1 - ddsHTSeq_HL60.fpkm_expressed_sig$Mean_siOCT_R848/ddsHTSeq_HL60.fpkm_expressed_sig$Mean_siC_R848)
+ddsHTSeq_HL60.fpkm_expressed_sig$PercenInhi2 = -100*(1 -(ddsHTSeq_HL60.fpkm_expressed_sig$Mean_siOCT_R848-ddsHTSeq_HL60.fpkm_expressed_sig$Mean_siOCT_C)/(ddsHTSeq_HL60.fpkm_expressed_sig$Mean_siC_R848-ddsHTSeq_HL60.fpkm_expressed_sig$Mean_siC_C))
+#ddsHTSeq_HL60.fpkm_expressed_sig$PercenInhi3 = -100*(1 -(ddsHTSeq_HL60.fpkm_expressed_sig$Mean_siC_R848_noBG/ddsHTSeq_HL60.fpkm_expressed_sig$Mean_siOCT_R848_noBG))
+genes = c("POU2F2","NFKBIZ","IL8")
+selected_genes = ddsHTSeq_HL60.fpkm_expressed_sig[which(ddsHTSeq_HL60.fpkm_expressed_sig$SYMBOL%in%genes),]
+
+silencing <- function(data){
+  ####siC UT
+  colnames(data) = c("HL60_siCtrl_C1","HL60_siCtrl_C2","HL60_siCtrl_C3","HL60_siCtrl_C4","HL60_siOCT_C1","HL60_siOCT_C2","HL60_si_OCT2_C3","HL60_si_OCT2_C4",
+                    "HL60_siCtrl_R848_1","HL60_siCtrl_R848_2","HL60_siCtrl_R848_3","HL60_siCtrl_R848_4","HL60_siOCT_R848_1","HL60_siOCT_R848_2","HL60_si_OCT2_R848_3","HL60_si_OCT2_R848_4",
+                    "SYMBOL","gene_name","altnames")
+  data$Mean_siC_C = rowMeans(as.matrix(data[,1:4]))
+  data$Sds_siC_C = rowSds(as.matrix(data[,1:4]))
+  data$CV_siC_C = data$Sds_siC_C/data$Mean_siC_C
+  ####siC R848
+  data$Mean_siC_R848 = rowMeans(as.matrix(data[,9:12]))
+  data$Sds_siC_R848 = rowSds(as.matrix(data[,9:12]))
+  data$CV_siC_R848= data$Sds_siC_R848/data$Mean_siC_R848
+  ####siOCT2 UT
+  data$Mean_siC_R848_noBG = data$Mean_siC_R848-data$Mean_siC_C
+  data$Mean_siOCT_C = rowMeans(as.matrix(data[,5:8]))
+  data$Sds_siOCT_C = rowSds(as.matrix(data[,5:8]))
+  data$CV_siOCT_C = data$Sds_siOCT_C/data$Mean_siOCT_C
+  ####siOCT2 R848
+  data$Mean_siOCT_R848 = rowMeans(as.matrix(data[,13:16]))
+  data$Sds_siOCT_R848 = rowSds(as.matrix(data[,13:16]))
+  data$CV_siOCT_R848 = data$Sds_siOCT_R848/data$Mean_siOCT_R848
+  ####
+  data$Mean_siOCT_R848_noBG = data$Mean_siOCT_R848-data$Mean_siOCT_C
+  data$PercenInhi2 = -100*(1- (data$Mean_siOCT_R848_noBG/data$Mean_siC_R848_noBG))
+  return(data)
+}
+
+data = silencing(ddsHTSeq_HL60.fpkm_expressed_sig)
+
+boxplot(log2(data[,c("Mean_siC_R848","Mean_siOCT_R848")]),notch=T)
+boxplot(log2(data[,c("Mean_siC_R848","Mean_siOCT_R848")]),notch=T,ylim=c(3,7.5))
+
+t.test(data[,c("Mean_siC_R848")],data[,c("Mean_siOCT_R848")],paired = T)
+
+data2 = log2(data[,c("Mean_siC_R848","Mean_siOCT_R848")])
+p <- ggplot(data2,aes(x=Mean_siC_R848,y=Mean_siOCT_R848)) + geom_violin()
+
+
+df.m <- reshape2::melt(data2,id.vars=NULL)
+p <- ggplot(df.m,aes(x=variable,y=value)) + geom_violin()
+
+ggplot(df.m, aes(x=variable,y=value)) + stat_ecdf()
+
+ggplot2.violinplot(data=data2)
+plot(ecdf(data2[,1]),col="blue")
+lines(ecdf(data2[,2]),col="red")
+
+head(PercenInhi)
+dim(subset(PercenInhi,PercenInhi$PercenInhi2 < -20))
+#### 10 %
+# data = ddsHTSeq_HL60.fpkm_expressed_sig[,c("Mean_siC_R848","Mean_siOCT_R848","Mean","FC_siOCT_vs_siC","PercenInhi","SYMBOL","altnames")]
+# summary(log2(data[,c("Mean","FC_siOCT_vs_siC")]))
+
+#data = ddsHTSeq_HL60.fpkm_expressed_sig
+data[grepl("IRAK3",data$SYMBOL),]
+data[grepl("IL8",data$SYMBOL),]
+data[grepl("POU2F2",data$SYMBOL),]
+data[grepl("NFKBIZ",data$SYMBOL),]
+data[grepl("LYN",data$SYMBOL),]
+
+data = subset(data,!data$PercenInhi2 < -100) 
+Inhi_10per = subset(data,data$PercenInhi2 < -10); dim(Inhi_10per)
+Inhi_10per = Inhi_10per[order(Inhi_10per$PercenInhi2),]
+head(Inhi_10per)
+tail(Inhi_10per)
+
+Up_10per = subset(data,data$PercenInhi2 > 10); dim(Up_10per)
+Up_10per = Up_10per[order(Up_10per$PercenInhi2),]; dim(Up_10per)
+head(Up_10per)
+tail(Up_10per)
+
+Inhi_20per = subset(data,data$PercenInhi2 < -20); dim(Inhi_20per)
+Inhi_20per = Inhi_20per[order(Inhi_20per$PercenInhi2),]
+head(Inhi_20per)
+tail(Inhi_20per)
+WriteXLS("Inhi_20per", "/home/pg/Dropbox/FILES PAPER OCT2/Inhi_20per_SD.xls")
+
+Up_20per = subset(data,data$PercenInhi2 > 20); dim(Up_20per)
+Up_20per = Up_20per[order(Up_20per$PercenInhi2),]
+head(Up_20per)
+tail(Up_20per)
+
+## 20%
+
+WriteXLS("data","/home/pg/Dropbox/FILES PAPER OCT2/Supplementary table 5.xls")
+WriteXLS("data","/home/pg/Dropbox/FILES PAPER OCT2/data_SD.xls")
+
+
+head(data[order(data$FC_siOCT_vs_siC),])
+summary(log2(data[,c("Mean","FC_siOCT_vs_siC")]))
+data1 = subset(data,data$PercenInhi2> 20);dim(data1)
+Inhi_10per = as.data.frame(data1) 
+data2 = subset(data,data$PercenInhi2 < -20);dim(data2)
+labs_data = subset(data2,data2$SYMBOL%in%c("IL8","POU2F2","NFKBIZ"))
+data = subset(data,!rownames(data)%in%c(rownames(data1),rownames(data2)));dim(data)
+data4 = data2[order(data2$Mean,decreasing = T),]
+cairo_ps(filename="/home/pg/Documents/Shared-Win10/Paper_OCT2/HL60_foldchanges_20per16samples_all.ps",width=10,height = 10,pointsize=12)
+
+p <- ggplot(data, aes(x = log2(Mean), y = PercenInhi2)) + geom_point(size=3, colour = "grey") +
+  scale_y_continuous(squish_trans(-100,20,-4),breaks = c(-100,-20,0,20,100)) +
+  theme(panel.background = element_blank()) + labs(x = "log2 FPKM", y="Percent of inhibition") +theme_bw()
+
+p + geom_point(data = data1, colour = "darkred",size=3) + geom_point(data = data2, colour = "darkblue",size=3) + ylim(-100,100) +
+  geom_hline(yintercept=c(-20,20), linetype="dashed", color = c("black","black")) + geom_point(data = labs_data, colour = "blue",size=3) +
+  ggrepel::geom_label_repel(data = labs_data, mapping = aes(label = SYMBOL)) + mytheme
+dev.off()
+
+#############
+
+res_R848_mod = subset(res_R848,res_R848$padj < 0.05)
+res_R848_mod = subset(res_R848_mod,res_R848_mod$log2FoldChange> 0)
+ddsHTSeq_HL60.fpkm_expressed_sig = subset(ddsHTSeq_HL60.fpkm_expressed,rownames(ddsHTSeq_HL60.fpkm_expressed)%in%rownames(res_R848_mod))
+
+
+mydata = ddsHTSeq_HL60.fpkm_expressed_sig
+t(colnames(mydata))
+rownames(mydata) = ddsHTSeq_HL60.fpkm_expressed_sig$SYMBOL
+#mydata1 = mydata[,c(1,2,9,10,3,4,11,12,5,6,13,14,7,8,15,16)] #### for all samples
+#mydata1 = mydata[,c(1,2,9,3,4,10,5,6,11,7,8,12)] #### for 12 samples
+mydata1 = mydata#[,c(1,5,3,7,2,6,4,8,10,14,12,16,9,13,11,15)] #### for 16 samples
+t(colnames(mydata1))
+zmydata = t(scale(t(mydata1[,1:16]), center = TRUE, scale = TRUE))
+summary(zmydata)
+head(zmydata,50)
+
+hmcol <-colorRampPalette(c("green","black","red"),space="rgb")(100)
+
+annotation_col = data.frame(Condition=c("siC_UT","siC_UT","siC_UT","siC_UT","siOCT2_UT","siOCT2_UT","siOCT2_UT","siOCT2_UT","siC_R848","siC_R848","siC_R848","siC_R848","siOCT2_R848","siOCT2_R848","siOCT2_R848","siOCT2_R848")) ### for all samples
+
+
+
+rownames(annotation_col) = colnames(zmydata)
+ann_colors = list(Condition= c(siC_UT ="blue",siC_R848="red",siOCT2_UT="green",siOCT2_R848="orange"))
+ann_colors = list(Condition= c(siC_UT ="blue",siC_R848="red",siOCT2_UT="green",siOCT2_R848="orange"))
+
+
+bk = unique(c(seq(-3.5,3.5, length=100)))
+library(colorRamps)
+#cairo_ps(filename="/home/pg/Documents/Shared-Win10/Paper_OCT2/PMN_R848_top50Heatmap.ps",width=10,height = 10,pointsize=12)
+pheatmap(zmydata,kmeans_k = NA,show_colnames =F,show_rownames = F,cluster_cols = F,
+         annotation_colors =ann_colors,annotation_col = annotation_col,
+         cluster_rows =T,clustering_distance_rows = "euclidean", cutree_rows=1,fontsize=10,
+         scale="none",color =hmcol,border_color=NA, cellwidth = 20,legend_breaks=c(-1.5,0,1.5),breaks=bk)
+dev.off()
+
+pheatmap(log2(mydata1+1),kmeans_k = NA,show_colnames =F,show_rownames = F,cluster_cols = F,
+         annotation_colors =ann_colors,annotation_col = annotation_col,
+         cluster_rows =T,clustering_distance_rows = "euclidean", cutree_rows=1,fontsize=10,
+         scale="none",color =hmcol,border_color=NA, cellwidth = 20)
+
+
+
+####### heapmat correlation HL60 in PMN
+
+file="/media/pg/Volume_4T/Analysis/CHIP_SEQ/hg19/Homer/Replicati_Biologici_1/DATA_ANALYSIS/Homer_peaks/TF/hPMN_UT_ChIP_OCT2_21h_200bp_L4_C1.ann"
+OCT2_peaks_UT = read.delim(file=file,header=TRUE,sep="\t")
+dim(OCT2_peaks_UT)
+head(OCT2_peaks_UT)
+library(org.Hs.eg.db)
+OCT2_peaks_UT$altName = mapIds(org.Hs.eg.db,keys=as.vector(OCT2_peaks_UT$Nearest.Ensembl),column = c("SYMBOL"),keytype="ENSEMBL",multiVals="first")
+OCT2_peaks_UT$UNIPROT = mapIds(org.Hs.eg.db,keys=as.vector(OCT2_peaks_UT$Nearest.Ensembl),column = c("UNIPROT"),keytype="ENSEMBL",multiVals="first")
+OCT2_peaks_UT[grepl("CXCL8",OCT2_peaks_UT$Gene.Name),]
+
+
+OCT2_peaks_UT_score = aggregate(Peak.Score~Gene.Name,data=DataFrame(OCT2_peaks_UT),sum)
+OCT2_peaks_UT_score = OCT2_peaks_UT_score[2:nrow(OCT2_peaks_UT_score),]
+dim(OCT2_peaks_UT_score)
+
+file="/media/pg/Volume_4T/Analysis/CHIP_SEQ/hg19/Homer/Replicati_Biologici_1/DATA_ANALYSIS/Homer_peaks/TF/hPMN_R848_ChIP_OCT2_21h_200bp_L4_C1.ann"
+OCT2_peaks_R848 = read.delim(file=file,header=TRUE,sep="\t")
+head(No_OCT2_peaks[order(No_OCT2_peaks$Mean_siC_R848,decreasing = T),],20)
+OCT2_peaks_R848[grepl("BCL2L1",OCT2_peaks_R848$Gene.Name),]
+OCT2_peaks_R848[grepl("6412728",OCT2_peaks_R848$Start),]
+OCT2_peaks_R848[grepl("chr20-41",OCT2_peaks_R848$PeakID..cmd.annotatePeaks.pl.Homer_peaks.TF.hPMN_R848_ChIP_OCT2_21h_200bp_L4_C1.txt.hg19.),]
+
+OCT2_peaks_R848_score = aggregate(Peak.Score~Gene.Name,data=DataFrame(OCT2_peaks_R848),sum)
+OCT2_peaks_R848_score = OCT2_peaks_R848_score[2:nrow(OCT2_peaks_R848_score),]
+dim(OCT2_peaks_R848_score)
+
+OCT2_peaks_score = merge(OCT2_peaks_UT_score,OCT2_peaks_R848_score,by="Gene.Name",all=TRUE)
+rownames(OCT2_peaks_score) = OCT2_peaks_score$Gene.Name
+OCT2_peaks_score = OCT2_peaks_score[,2:3]
+colnames(OCT2_peaks_score) = c("UT","R848")
+OCT2_peaks_score[is.na(OCT2_peaks_score)] <-1
+OCT2_peaks_score$bound = "yes"
+
+OCT2_peaks_score_10P = subset(OCT2_peaks_score,rownames(OCT2_peaks_score)%in%Inhi_10per$SYMBOL);dim(OCT2_peaks_score_10P) ### 200 genes
+No_OCT2_peaks = subset(Inhi_10per,!Inhi_10per$SYMBOL%in%rownames(OCT2_peaks_score));dim(No_OCT2_peaks) ### 112 genes
+No_OCT2_peaks[grepl("CXCL8",No_OCT2_peaks$altnames),]
+dim(No_OCT2_peaks)
+
+No_OCT2_peaks_data = data.frame(UT=1:nrow(No_OCT2_peaks),R848=1:nrow(No_OCT2_peaks))
+rownames(No_OCT2_peaks_data) = No_OCT2_peaks$SYMBOL
+No_OCT2_peaks_data[No_OCT2_peaks_data < 100 ] <- 1
+No_OCT2_peaks_data$bound = "no"
+data = rbind(OCT2_peaks_score_10P,No_OCT2_peaks_data)
+data = data[order(rowMeans(data[,1:2]),decreasing = T),]
+data = data[order(data[,2],decreasing = T),]
+
+ddsHTSeq_PMN.sva.fpkm_data[grepl("IL8",ddsHTSeq_PMN.sva.fpkm_data$symbol),]
+data2 = merge(data,ddsHTSeq_PMN.sva.fpkm_data,by.x=0,by.y="altname",all=FALSE)
+                                                                       
+rownames(data2) = data2$Row.names
+data2 = data2[,2:ncol(data2)]
+data2[grepl("CXCL8",rownames(data2)),]
+data3 = subset(data,!rownames(data)%in%ddsHTSeq_PMN.sva.fpkm_data$altname)
+data3[,c("PMN_UT_21h","PMN_UT_Repl_2","PMN_R848_21h","PMN_R848_Repl_2")] = data.frame(PMN_UT_21h=runif(nrow(data3),0,1),PMN_UT_Repl_2=runif(nrow(data3),0,2),
+                                                                                      PMN_R848_21h=runif(nrow(data3),0,1),PMN_R848_Repl_2=runif(nrow(data3),0,2))
+data3$symbol = rownames(data3)   
+
+data2 = rbind(data2,data3)
+dim(subset(data2,data2$bound=="yes"))
+dim(subset(data2,data2$bound=="no"))
+
+# #data2 = data2[order(rowMeans(data2[,c("UT","R848","PMN_UT_Repl_2","PMN_R848_21h","PMN_R848_Repl_2")]),data2$bound,decreasing = T),]
+# data2 = data2[order(data2$bound,rowMeans(data2[,c("UT","R848","PMN_UT_Repl_2","PMN_R848_21h","PMN_R848_Repl_2")]),decreasing = T),]
+# annotation_row = data.frame(data2$bound)
+# colnames(annotation_row) = c("bound")
+# rownames(annotation_row) = rownames(data2)
+# ann_colors = list(bound = c(yes = "#1B9E77", no = "#D95F02"))
+# 
+# cairo_ps(filename="/home/pg/Documents/Shared-Win10/Paper_OCT2/HL60_heatmap10Per.ps",width=10,height = 10,pointsize=12)
+# pheatmap(log2(data2[,c(1:2)]),show_rownames = F,color = colorRampPalette(c("white","red","darkred"))(50),
+#          cluster_rows = F,annotation_colors=ann_colors,annotation_row=annotation_row,cluster_col=F,border_color = NA)
+# dev.off()
+# 
+# pheatmap(log2(data[,1:2]),show_rownames = F,color = colorRampPalette(c("white","red","darkred"))(50))#,
+#          cluster_rows = F,annotation_colors=ann_colors,annotation_row=annotation_row,cluster_col=F,border_color = NA)
+# 
+# data
+# 
+# cairo_ps(filename="/home/pg/Documents/Shared-Win10/Paper_OCT2/HL60_heatmap10Per_geneExp.ps",width=10,height = 10,pointsize=12)
+# pheatmap(log2(data2[,4:7]+1),show_rownames = F,color = colorRampPalette(c("green","darkgreen","black","darkred","red"))(50),
+#          cluster_rows = F,annotation_colors=ann_colors,annotation_row=annotation_row,cluster_col=F,border_color = NA)
+# dev.off()
+
+#### 20 percento
+
+OCT2_peaks_score$Ensembl = mapIds(org.Hs.eg.db,keys=as.vector(rownames(OCT2_peaks_score)),column = c("ENSEMBL"),keytype="SYMBOL",multiVals="first")
+OCT2_peaks_score[grepl("RAC1",rownames(OCT2_peaks_score)),]
+123
+
+OCT2_peaks_score_20P = subset(OCT2_peaks_score,OCT2_peaks_score$Ensembl%in%rownames(Inhi_20per));dim(OCT2_peaks_score_20P) ### 228 genes
+No_OCT2_peaks = subset(Inhi_20per,!rownames(Inhi_20per)%in%OCT2_peaks_score$Ensembl);dim(No_OCT2_peaks) ### 40 genes
+No_OCT2_peaks[grepl("IL8",rownames(No_OCT2_peaks)),]
+dim(No_OCT2_peaks)
+
+beta_association = read.delim("/media/pg/Volume2_4T/RNA_SEQ_our/Mono_PMN_R848_UT/BETA/DESeq2_res_03fpkm_paper/hPMN_R848_ChIP_OCT2_21h_DESeq2_res_03fpkm/hPMN_R848_ChIP_OCT2_21h_uptarget.txt")
+dim(subset(beta_association,beta_association$GeneSymbol%in%Inhi_20per$altnames))
+
+
+
+No_OCT2_peaks_data = data.frame(UT=1:nrow(No_OCT2_peaks),R848=1:nrow(No_OCT2_peaks))
+rownames(No_OCT2_peaks_data) = No_OCT2_peaks$SYMBOL
+No_OCT2_peaks_data[No_OCT2_peaks_data < 100 ] <- 1
+No_OCT2_peaks_data$bound = "no"
+data = rbind(OCT2_peaks_score_10P,No_OCT2_peaks_data)
+data = data[order(rowMeans(data[,1:2]),decreasing = T),]
+data = data[order(data[,2],decreasing = T),]
+
+
+ddsHTSeq_PMN.sva.fpkm_data[grepl("IL8",ddsHTSeq_PMN.sva.fpkm_data$symbol),]
+data2 = merge(data,ddsHTSeq_PMN.sva.fpkm_data,by.x=0,by.y="altname",all=FALSE)
+
+rownames(data2) = data2$Row.names
+data2 = data2[,2:ncol(data2)]
+data2[grepl("CXCL8",rownames(data2)),]
+data3 = subset(data,!rownames(data)%in%ddsHTSeq_PMN.sva.fpkm_data$altname)
+data3[,c("PMN_UT_21h","PMN_UT_Repl_2","PMN_R848_21h","PMN_R848_Repl_2")] = data.frame(PMN_UT_21h=runif(nrow(data3),0,1),PMN_UT_Repl_2=runif(nrow(data3),0,2),
+                                                                                      PMN_R848_21h=runif(nrow(data3),0,1),PMN_R848_Repl_2=runif(nrow(data3),0,2))
+data3$symbol = rownames(data3)   
+
+data2 = rbind(data2,data3)
+dim(subset(data2,data2$bound=="yes"))
+dim(subset(data2,data2$bound=="no"))
+
+#data2 = data2[order(rowMeans(data2[,c("UT","R848","PMN_UT_Repl_2","PMN_R848_21h","PMN_R848_Repl_2")]),data2$bound,decreasing = T),]
+data2 = data2[order(data2$bound,rowMeans(data2[,c("UT","R848","PMN_UT_Repl_2","PMN_R848_21h","PMN_R848_Repl_2")]),decreasing = T),]
+annotation_row = data.frame(data2$bound)
+colnames(annotation_row) = c("bound")
+rownames(annotation_row) = rownames(data2)
+ann_colors = list(bound = c(yes = "#1B9E77", no = "#D95F02"))
+
+cairo_ps(filename="/home/pg/Documents/Shared-Win10/Paper_OCT2/HL60_heatmap20per.ps",width=10,height = 10,pointsize=12)
+pheatmap(log2(data2[,c(1:2)]),show_rownames = F,color = colorRampPalette(c("white","red","darkred"))(50),
+         cluster_rows = F,annotation_colors=ann_colors,annotation_row=annotation_row,cluster_col=F,border_color = NA)
+dev.off()
+
+cairo_ps(filename="/home/pg/Documents/Shared-Win10/Paper_OCT2/HL60_heatmap20per_geneExp.ps",width=10,height = 10,pointsize=12)
+pheatmap(log2(data2[,4:7]+1),show_rownames = F,color = colorRampPalette(c("green","darkgreen","black","darkred","red"))(50),
+         cluster_rows = F,annotation_colors=ann_colors,annotation_row=annotation_row,cluster_col=F,border_color = NA)
+dev.off()
+
+################################################################################################################
+
+load(file = "ddsHTSeq_HL60.RData")
+
+#ddsHTSeq_HL60 = ddsHTSeq_HL60[,!colData(ddsHTSeq_HL60)$Exp%in%c("exp3")]
+data.frame(colData(ddsHTSeq_HL60))
+design(ddsHTSeq_HL60) <- formula(~ Exp + silencing + altCondition + silencing:altCondition)
+#design(ddsHTSeq_HL60) <- formula(~ Exp + Group2)
+#ddsHTSeq_HL60$Exp <- droplevels(ddsHTSeq_HL60$Exp)
+ddsHTSeq_HL60$altCondition = relevel(ddsHTSeq_HL60$altCondition, ref = "R848")
+ddsHTSeq_HL60$silencing = relevel(ddsHTSeq_HL60$silencing, ref = "siC")
+
+#ddsHTSeq_HL60$Group2= relevel(ddsHTSeq_HL60$Group2, ref = "UTsiC")
+
+
+ddsHTSeq_HL60 = DESeq(ddsHTSeq_HL60)
+plotDispEsts(ddsHTSeq_HL60)
+
+
+boxplot(log2(counts(ddsHTSeq_HL60,normalized=TRUE)+1))
+resultsNames(ddsHTSeq_HL60)
+res_R848 <- results(ddsHTSeq_HL60,alpha=0.05, name =c("silencing_siOCT_vs_siC"),cooksCutoff=T,independentFiltering=T)
+res_R848 <- lfcShrink(ddsHTSeq_HL60, coef="silencing_siOCT_vs_siC", type="apeglm")
+res_R848$SYMBOL = mcols(ddsHTSeq_HL60)$SYMBOL
+res_R848 = res_R848[order(res_R848$padj),]
+
+summary(res_R848)
+##### QC 
+# plotDispEsts(ddsHTSeq_HL60)
+# colData(ddsHTSeq_HL60)
+# ddsHTSeq_HL60_rld  <- rlogTransformation(ddsHTSeq_HL60, blind=FALSE)
+# distsRL <- dist(t(assay(ddsHTSeq_HL60_rld)))
+# mat <- as.matrix(distsRL)
+# rownames(mat) <-  colData(ddsHTSeq_HL60_rld)$condition
+# colnames(mat) <-  colData(ddsHTSeq_HL60_rld)$sampleName
+# 
+# ddsHTSeq_HL60_rld_cor = cor(assay(ddsHTSeq_HL60_rld))
+# pheatmap(ddsHTSeq_HL60_rld_cor)
+# 
+# library(colorRamps)
+# library(pheatmap)
+# hmcol <- rev(blue2green2red(500))
+# pheatmap(mat,clustering_distance_rows = distsRL, clustering_distance_cols =distsRL,color = hmcol)
+# library(pcaExplorer)
+# plotPCA(ddsHTSeq_HL60_rld,intgroup = "condition")
+# plotPCA(ddsHTSeq_HL60_rld,intgroup = "Exp")
+# plotPCA(ddsHTSeq_HL60_rld,intgroup = "silencing")
+# 
+ddsHTSeq_HL60.fpkm = fpkm(ddsHTSeq_HL60,robust = TRUE)
+mcols(ddsHTSeq_HL60)
+colData(ddsHTSeq_HL60)
+# # expressed <- function(fpkm_data,dds){
+# #   threshod =0.3
+# #   f = subset(fpkm_data,(rowMeans2(fpkm_data[,1:2]) >=threshod | rowMeans2(fpkm_data[,3:4]) >=threshod | rowMeans2(fpkm_data[,5:6]) >=threshod | rowMeans2(fpkm_data[,7:8]) >=threshod) | rowMeans2(fpkm_data[,9:10]) >=threshod | rowMeans2(fpkm_data[,11:12]) >=threshod)
+# #   dds = subset(dds,rownames(dds)%in%rownames(f))
+# #   g = data.frame(f,mcols(dds)[,c("SYMBOL","gene_name","altnames")])
+# #   a = g[order(rowSums(g[,1:4])),]
+# #   return(a)
+# # }
+# 
+expressed <- function(fpkm_data,dds){
+  threshod = 0.3
+  f = subset(fpkm_data,(rowMeans2(fpkm_data[,1:2]) >=threshod | rowMeans2(fpkm_data[,3:4]) >=threshod | rowMeans2(fpkm_data[,5:6]) >=threshod | rowMeans2(fpkm_data[,7:8]) >=threshod) | rowMeans2(fpkm_data[,9:10]) >=threshod | rowMeans2(fpkm_data[,11:12]) >=threshod | rowMeans2(fpkm_data[,13:14]) >=threshod | rowMeans2(fpkm_data[,15:16]) >=threshod)
+  dds = subset(dds,rownames(dds)%in%rownames(f))
+  g = data.frame(f,mcols(dds)[,c("SYMBOL","gene_name","altnames")])
+  a = g[order(rowSums(g[,1:4])),]
+  return(a)
+}
+
+expressed <- function(fpkm_data,dds){
+  threshod = 0.3
+  f = subset(fpkm_data,(rowMeans2(fpkm_data[,1:4]) >=threshod | rowMeans2(fpkm_data[,5:8]) >=threshod | rowMeans2(fpkm_data[,9:12]) >=threshod | rowMeans2(fpkm_data[,13:16]) >=threshod))
+  dds = subset(dds,rownames(dds)%in%rownames(f))
+  g = data.frame(f,mcols(dds)[,c("SYMBOL","gene_name","altnames")])
+  a = g[order(rowSums(g[,1:4])),]
+  return(a)
+}
+
+# 
+# 
+ddsHTSeq_HL60.fpkm_expressed = expressed(ddsHTSeq_HL60.fpkm,ddsHTSeq_HL60) ###  15524
+dim(ddsHTSeq_HL60.fpkm_expressed) ## genes 15806
+ddsHTSeq_HL60.fpkm_expressed[grepl("POU2F2",ddsHTSeq_HL60.fpkm_expressed$SYMBOL),]
+ddsHTSeq_HL60.fpkm_expressed[grepl("^CCL4$",ddsHTSeq_HL60.fpkm_expressed$SYMBOL),]
+ddsHTSeq_HL60.fpkm_expressed[grepl("^IL8$",ddsHTSeq_HL60.fpkm_expressed$SYMBOL),]
+ddsHTSeq_HL60.fpkm_expressed[grepl("^ACTN1$",ddsHTSeq_HL60.fpkm_expressed$SYMBOL),]
+ddsHTSeq_HL60.fpkm_expressed[grepl("CHKB-CPT1B",ddsHTSeq_HL60.fpkm_expressed$SYMBOL),]
+
+# 
+ddsHTSeq = subset(ddsHTSeq_HL60,rownames(ddsHTSeq_HL60)%in%rownames(ddsHTSeq_HL60.fpkm_expressed))
+# colData(ddsHTSeq)
+# colnames(ddsHTSeq)
+# ##### Stimolo
+# #ddsHTSeq = ddsHTSeq_HL60
+
+
+colData(ddsHTSeq_HL60)
+resultsNames(ddsHTSeq)
+
+FoldChange <- function(dds){
+  count = as.data.frame(counts(dds, normalized=TRUE))
+  count$MeanSiC_UT = rowMeans(count[,1:4])
+  count$MeanSiOCT2_UT = rowMeans(count[,5:9])
+  count$MeanSiC_R848 = rowMeans(count[,10:12])
+  count$MeanSiOCT2_R848 = rowMeans(count[,12:16])
+  count$FCSiC_Stimulation= log2(count$MeanSiC_R848/count$MeanSiC_UT)
+  count$FCSiOCT2_Stimulation= log2(count$MeanSiOCT2_R848/count$MeanSiC_R848)
+  count$FC= count$FCSiOCT2_Stimulation - count$FCSiC_Stimulation 
+  g = data.frame(count,mcols(dds)[,c("SYMBOL","gene_name","altnames")])
+  return(g)
+}
+
+
+#### R848 vs UT
+
+counts = FoldChange(ddsHTSeq)
+counts[grepl("POU2F2",counts$SYMBOL),]
+counts[grepl("HMGN4",counts$SYMBOL),]
+
+resultsNames(ddsHTSeq)
+colData(ddsHTSeq)
+
+res_R848 <- results(ddsHTSeq,alpha=0.05, name =c("altCondition_R848_vs_UT"))
+res_R848 <- results(ddsHTSeq,alpha=0.05, contrast = c("Group2","R848siOCT","R848siC"),cooksCutoff=F,independentFiltering=F)
+res_R848 <- results(ddsHTSeq,alpha=0.05, name =c("silencingsiOCT.altConditionR848"),cooksCutoff=F,independentFiltering=F,addMLE=TRUE)
+
+summary(res_R848)
+res_R848$SYMBOL = mcols(ddsHTSeq)$SYMBOL
+res_R848 = res_R848[order(res_R848$padj),]
+res_R848[grepl("POU2F2",res_R848$SYMBOL),]
+res_R848[grepl("HMGN4",res_R848$SYMBOL),]
+res_R848$altnames = mcols(ddsHTSeq)$altnames
+
+head(data.frame(res_R848[order(res_R848$padj),]),20)
+res_R848[grepl("POU2F2",res_R848$SYMBOL),]
+ddsHTSeq_HL60.fpkm_expressed[grepl("NPIPA8" ,ddsHTSeq_HL60.fpkm_expressed$SYMBOL),]
+ddsHTSeq_HL60.fpkm_expressed[grepl("NPIPA8 ",ddsHTSeq_HL60.fpkm_expressed$SYMBOL),]
+
+res_siOCT <- results(ddsHTSeq,alpha=0.05, name =c("silencingsiOCT.altConditionR848"),cooksCutoff=F,independentFiltering=F)
+res_siOCT = results(ddsHTSeq, alpha=0.05 , contrast=list("silencing_siOCT_vs_siC","altCondition_R848_vs_UT")) ##1
+res_siOCT = results(ddsHTSeq, alpha=0.05 , contrast=list("silencingsiOCT.altConditionR848","altCondition_R848_vs_UT"), cooksCutoff=F,independentFiltering=F)
+
+#res_siOCT = results(ddsHTSeq, alpha=0.05 , contrast=list("Group2_R848siOCT_vs_UTsiC", "Group2_R848siC_vs_UTsiC"))
+
+summary(res_siOCT)
+res_siOCT$SYMBOL = mcols(ddsHTSeq)$SYMBOL
+
+res_siOCT = subset(res_siOCT,res_siOCT$padj<0.05)
+head(data.frame(res_siOCT[order(res_siOCT$padj),]),20)
+tail(data.frame(res_siOCT[order(res_siOCT$log2FoldChange, decreasing = T),]),20)
+res_siOCT[grepl("POU2F2",res_siOCT$SYMBOL),]
+res_siOCT[grepl("NFKBIZ",res_siOCT$SYMBOL),]
+counts[grepl("HMGN4",counts$SYMBOL),]
+counts[grepl("NPIPA8",counts$SYMBOL),]
+
+ddsHTSeq_HL60.fpkm_expressed[grepl("^CCL4$",ddsHTSeq_HL60.fpkm_expressed$SYMBOL),]
+ddsHTSeq_HL60.fpkm_expressed[grepl("CCL20",ddsHTSeq_HL60.fpkm_expressed$SYMBOL),]
+ddsHTSeq_HL60.fpkm_expressed[grepl("^CCL3$",ddsHTSeq_HL60.fpkm_expressed$SYMBOL),]
+
+
+with(res_R848, plot(log2FoldChange, -log10(padj), pch=16, cex=0.5, main="Volcano plot",
+                     xlim=c(-10,10),col=ifelse(padj < 0.05,'red','black')))
+
+
+plotMA(res_R848)
+with(res_siOCT, plot(log2FoldChange, -log10(padj), pch=16, cex=0.5, main="Volcano plot",
+                    xlim=c(-10,10),col=ifelse(padj < 0.05,'red','black')))
+
+
+
+data = data.frame(res_R848);dim(data)
+#data = data.frame(res_siOCT2);dim(data)
+data <- data[!is.na(data$padj),];dim(data)
+data1 = data.frame(subset(data,data$padj<=0.05 & data$log2FoldChange >0))
+data2 = data.frame(subset(data,data$padj<=0.05 & data$log2FoldChange < 0))
+
+labs_data = subset(data1,data1$SYMBOL%in%c("IL8","NFKBIZ","POU2F2"))
+labs_data = labs_data[order(labs_data$padj),]
+labs_data$FC= paste(labs_data$SYMBOL,round(labs_data$log2FoldChange,2),sep=" , ")
+
+modulated = rbind(data1,data2)
+
+data = subset(data,!rownames(data)%in%c(rownames(data1),rownames(data2)));dim(data)
+summary(data)
+
+#data = subset(data,data$padj>0.5)
+
+#data = sample_n(data , 5000)
+
+
+library(ggplot2)
+
+#cairo_ps(filename="/home/pg/Documents/Shared-Win10/Paper_OCT2/HL60_R848_OCT2_size3.ps",width=10,height = 10,pointsize=12)
+cairo_ps(filename="/home/pg/Documents/Shared-Win10/Paper_OCT2/HL60_R848_size3.ps",width=10,height = 10,pointsize=12)
+p <- ggplot(data, aes(x = log2FoldChange, y = -log10(padj))) + geom_point(size=3, colour = "grey") +
+  scale_y_continuous(trans = squish_trans(30,90,10), breaks = c(0,10,20,30,40,60,80),limits = c(0,90)) + 
+  scale_x_continuous(trans = squish_trans(-2,2,0.5),breaks = c(6,-4,-2,-1,0,1,2,4,6),limits = c(-6,6)) +
+  theme(panel.background = element_blank()) + labs(x = "log2FoldChange", y="log10 padj") +theme_bw()
+
+p + geom_point(data = data1, colour = "darkred",size=3) + geom_point(data = data2, colour = "darkblue",size=3) + geom_vline(xintercept=c(-1,1), linetype="dashed", color = c("black","black")) +
+  geom_hline(yintercept=-log10(0.05), linetype="dashed", color = "black") +
+  ggrepel::geom_label_repel(data = labs_data, mapping = aes(label = FC))  + mytheme + geom_point(data = labs_data, colour = "blue",size=3)
+
+dev.off()
+
+#### Silencing
+resultsNames(ddsHTSeq)
+res_siOCT2 <- results(ddsHTSeq, alpha=0.05, contrast = c("Group2","R848siOCT","UTsiC"))#,cooksCutoff=F, filterFun=ihw)
+summary(res_siOCT2)
+res_siOCT2$SYMBOL= mcols(ddsHTSeq)$SYMBOL
+res_siOCT2[grepl("POU2F2",res_siOCT2$SYMBOL),]
+head(data.frame(res_siOCT2[order(res_siOCT2$padj),]),20)
+counts = counts(ddsHTSeq,normalized=T)
+counts[grepl("ENSG00000028277",rownames(counts)),]
+counts[grepl("ENSG00000136244",rownames(counts)),] ### Il6
+counts[grepl("ENSG00000120217",rownames(counts)),] ### CD274
+
+count = as.data.frame(counts(ddsHTSeq,normalized=T))
+count$SYMBOL = mcols(ddsHTSeq)$SYMBOL
+rowSums(count[grepl("POU2F2",count$SYMBOL),][,1:16])
+log2((278.91+34.126)/(1059.8+1024.1))
+
+res_si_R848 <- results(ddsHTSeq,alpha=0.05, contrast = c("Group2","R848siC","R848siOCT"))
+summary(res_si_R848)
+res_si_R848$SYMBOL = mcols(ddsHTSeq)$SYMBOL
+head(data.frame(res_si_R848[order(res_si_R848$padj),]),20)
+res_si_R848[grepl("IL8",res_si_R848$SYMBOL),]
+res_si_R848[grepl("POU2F2",res_si_R848$SYMBOL),]
+
+with(res_si_R848, plot(log2FoldChange, -log10(padj), pch=16, cex=0.5, main="Volcano plot",
+                       xlim=c(-10,10),col=ifelse(padj < 0.05,'red','black')))
+
+
+
+
